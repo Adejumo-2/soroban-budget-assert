@@ -7,6 +7,7 @@ mod cli;
 mod compare;
 mod fixture;
 mod html_output;
+mod json_output;
 mod live;
 mod record;
 mod replay;
@@ -34,7 +35,6 @@ use wasmparser::Parser as WasmParser;
 
 mod derive;
 mod error;
-mod json_output;
 mod watch;
 
 /// Maximum number of total deployment attempts (1 initial + 3 retries)
@@ -1209,7 +1209,7 @@ fn run_derive_mode(args: &BudgetReportArgs, toml_config: &BudgetToml) -> Result<
 
     // 4) Run the derivation and write the outputs atomically.
     let derivation = derive::Derivation::from_report(&measurements, &config)?;
-    let timestamp_utc = build_utc_timestamp();
+    let timestamp_utc = build_utc_timestamp(std::time::SystemTime::now())?;
     let provenance = out_provenance.unwrap_or_else(|| default_provenance_path(&out_env));
     derive::write_outputs(
         &out_env,
@@ -1239,20 +1239,18 @@ fn default_provenance_path(out_env: &std::path::Path) -> std::path::PathBuf {
     out_env.with_extension("provenance.md")
 }
 
-/// UTC ISO-8601 timestamp at second precision — enough granularity
-/// for the provenance header without depending on `chrono`.
-fn build_utc_timestamp() -> String {
-    let now = std::time::SystemTime::now()
+fn build_utc_timestamp(now: std::time::SystemTime) -> Result<String> {
+    let now = now
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| Error::Message(format!("system time error: {e}")))
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // The header timestamp is descriptive, not asserted. The string
-    // form is seconds-since-epoch expressed as ISO-8601 by hand using
-    // the proleptic Gregorian calendar and its standard 4/100/400-year
-    // leap-year rule, which is sufficient for this human-readable
-    // audit trail.
-    format_unix_timestamp_as_iso8601(now)
+        .map_err(|e| Error::Message(format!("system time error: {e}")))?
+        .as_secs();
+    // The header timestamp is descriptive, not asserted, so it is
+    // fine to format it loosely. The string-form here is the
+    // seconds-since-epoch expressed in ISO-8601 by hand: the
+    // calendar math below is intentionally simple (no leap rules
+    // beyond the standard 4/100/400-year rule) and is sufficient
+    // for human-readable audit trail of when the derivation ran.
+    Ok(format_unix_timestamp_as_iso8601(now))
 }
 
 fn format_unix_timestamp_as_iso8601(secs: u64) -> String {
@@ -3197,5 +3195,20 @@ write_limit = 1000
         let reports: Vec<CostReport> = vec![];
         let csv = reports_to_csv(&reports, false);
         assert_eq!(csv, "package,function,metric,value\n");
+    }
+
+    #[test]
+    fn build_utc_timestamp_success() {
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1700000000);
+        let ts = build_utc_timestamp(now).expect("should return timestamp");
+        assert_eq!(ts, "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn build_utc_timestamp_fails_before_epoch() {
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let err = build_utc_timestamp(before_epoch).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("system time error"), "got {}", err_msg);
     }
 }
