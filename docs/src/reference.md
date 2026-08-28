@@ -1388,3 +1388,14 @@ Effects of this file:
 - `withdraw` has an entry but no `*_limit` fields, so its metrics are reported and it participates in `--check`'s fail-on-simulation-error rule, but no metric is enforced.
 - If `amm-pool-contract` were renamed tomorrow, every section above would keep working unchanged except `[scenarios.full_workflow]`, whose `package` value must match the annotation used by Tier A tests.
 - If `initialize` had been misspelled (e.g. `[functions.initialise]`), nothing would error and nothing would fail: the orphaned entry would be ignored, `initialize` would run unconfigured with no arguments, and none of its metrics would be enforced — the only symptom is missing rows in a later report.
+### `--rpc-url`
+Override the RPC URL for Soroban CLI invocation.
+
+### `--network-passphrase`
+Override the network passphrase for Soroban CLI invocation.
+
+### `--no-deploy-cache`
+Bypass deploying cache when running budget report.
+
+### `--source-secret`
+Supply a stellar secret key (S...) for deploy and invoke.

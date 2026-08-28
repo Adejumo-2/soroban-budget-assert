@@ -5,6 +5,7 @@ use anyhow::Context;
 mod arg_spec;
 mod cli;
 mod compare;
+mod deploy_cache;
 mod fixture;
 mod html_output;
 mod json_output;
@@ -729,12 +730,15 @@ fn extract_metrics(rpc_response: &serde_json::Value) -> Result<(u32, u32, u32)> 
 /// * `network` - The target network passphrase or alias.
 /// * `function` - The exported function name to invoke.
 /// * `func_args` - Additional CLI arguments forwarded after the `--` separator.
+/// * `rpc_override` - `Some((rpc_url, network_passphrase))` to target a custom
+///   local/standalone RPC node instead of a built-in `--network` alias (#49).
 fn build_invoke_args(
     contract_id: &str,
     source: &str,
     network: &str,
     function: &str,
     func_args: &[String],
+    rpc_override: Option<(&str, &str)>,
 ) -> Vec<String> {
     let mut invoke_args = vec![
         "contract".to_string(),
@@ -743,12 +747,22 @@ fn build_invoke_args(
         contract_id.to_string(),
         "--source".to_string(),
         source.to_string(),
-        "--network".to_string(),
-        network.to_string(),
-        "--build-only".to_string(),
-        "--".to_string(),
-        function.to_string(),
     ];
+    match rpc_override {
+        Some((rpc_url, passphrase)) => {
+            invoke_args.push("--rpc-url".to_string());
+            invoke_args.push(rpc_url.to_string());
+            invoke_args.push("--network-passphrase".to_string());
+            invoke_args.push(passphrase.to_string());
+        }
+        None => {
+            invoke_args.push("--network".to_string());
+            invoke_args.push(network.to_string());
+        }
+    }
+    invoke_args.push("--build-only".to_string());
+    invoke_args.push("--".to_string());
+    invoke_args.push(function.to_string());
     invoke_args.extend(func_args.iter().cloned());
     invoke_args
 }
@@ -1017,7 +1031,31 @@ fn scaffold_init(force: bool, quiet: bool) -> Result<()> {
 ///
 /// Each check fails fast with an actionable error message. Checks that are
 /// not applicable (e.g. rustup not installed) are silently skipped.
-fn run_preflight_checks(quiet: bool) -> Result<()> {
+fn run_preflight_checks(quiet: bool, source_secret: Option<&str>) -> Result<()> {
+    // ── source signing key (#123) ──────────────────────────────────────
+    // The chosen mechanism for a signing key that doesn't depend on the
+    // `stellar` CLI key store is `--source-secret` / `STELLAR_SECRET_KEY`
+    // (an `S...` ed25519 seed). It is validated here so a typo fails fast
+    // rather than deep inside a deploy. Native deploy/invoke that actually
+    // use it are a follow-up; today deploy/invoke still go through the
+    // `stellar` CLI, so its presence is still checked below.
+    if let Some(secret) = source_secret {
+        if !quiet {
+            eprint!("Checking --source-secret... ");
+        }
+        let ok = stellar_strkey::ed25519::PrivateKey::from_string(secret).is_ok();
+        if !ok {
+            return Err(Error::Message(
+                "--source-secret / STELLAR_SECRET_KEY is not a valid Stellar secret seed \
+                 (expected an `S...` strkey)"
+                    .to_string(),
+            ));
+        }
+        if !quiet {
+            eprintln!("ok");
+        }
+    }
+
     // ── stellar CLI ─────────────────────────────────────────────────────
     if !quiet {
         eprint!("Checking Stellar CLI... ");
@@ -1027,6 +1065,8 @@ fn run_preflight_checks(quiet: bool) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(Error::Message(
                 "Stellar CLI is not installed or not on PATH.\n\
+                 It is still required for contract deploy and invoke-build \
+                 (native RPC is a work in progress; see issue #123).\n\
                  Install it with:  cargo install --locked stellar-cli\n\
                  See: https://github.com/stellar/stellar-cli"
                     .to_string(),
@@ -1399,7 +1439,7 @@ fn main() -> anyhow::Result<()> {
     // Replay runs serve every network call from a fixture, so they need
     // neither the `stellar` CLI nor `curl`; skip the checks entirely.
     if args.replay.is_none() {
-        run_preflight_checks(args.quiet)?;
+        run_preflight_checks(args.quiet, args.source_secret.as_deref())?;
     }
 
     let toml_config = load_budget_toml("budget.toml")?;
@@ -1448,14 +1488,34 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Custom local/standalone RPC target (#49). `--network-passphrase` is
+    // clap-required alongside `--rpc-url`, so both are Some or both None.
+    let net_override = match (&args.rpc_url, &args.network_passphrase) {
+        (Some(rpc_url), Some(passphrase)) => Some(live::NetworkOverride {
+            rpc_url: rpc_url.clone(),
+            network_passphrase: passphrase.clone(),
+        }),
+        _ => None,
+    };
+
+    // With a custom RPC, the passphrase is the network's identity — use it
+    // as the `network` label (cache key, `stellar --network` fallback) when
+    // no explicit `--network` / `budget.toml` value is given.
     let network = args
         .network
         .or(toml_config.network.clone())
+        .or_else(|| net_override.as_ref().map(|o| o.network_passphrase.clone()))
         .context("missing --network or budget.toml network field")?;
     let source = args
         .source
         .or(toml_config.source.clone())
         .context("missing --source or budget.toml source field")?;
+
+    if let Some(o) = &net_override {
+        if !args.quiet {
+            eprintln!("Targeting custom RPC endpoint {}", o.rpc_url);
+        }
+    }
 
     if !args.quiet {
         eprintln!("Discovering workspace members...");
@@ -1489,10 +1549,21 @@ fn main() -> anyhow::Result<()> {
         TransportKind::Recording(record::RecordingTransport::new(live::LiveTransport::new(
             retry_config,
             args.quiet,
+            net_override.clone(),
         )))
     } else {
-        TransportKind::Live(live::LiveTransport::new(retry_config, args.quiet))
+        TransportKind::Live(live::LiveTransport::new(
+            retry_config,
+            args.quiet,
+            net_override.clone(),
+        ))
     };
+
+    // Deploy cache (#79): reuse a contract id across runs when the wasm
+    // hash, network, and source all match. `--replay` never deploys, so it
+    // has nothing to cache; `--no-deploy-cache` bypasses lookups but still
+    // records fresh deploys so a later cached run stays warm.
+    let mut deploy_cache = deploy_cache::DeployCache::load(std::path::Path::new("."));
 
     // Union of every function exported by every contract in the workspace.
     // Used at the end of the run (issue #399) to validate that every function
@@ -1605,20 +1676,44 @@ fn main() -> anyhow::Result<()> {
             Some(pb)
         };
 
-        let contract_id = deploy_contract_with_retry(
-            &mut transport,
-            wasm_path.as_std_path(),
-            &source,
-            &network,
-            &package.name,
-            &retry_config,
-        )?;
+        let wasm_std_path = wasm_path.as_std_path();
+        let wasm_sha = deploy_cache::wasm_hash(wasm_std_path)?;
+        let cached_id = if args.no_deploy_cache {
+            None
+        } else {
+            deploy_cache
+                .get(&wasm_sha, &network, &source)
+                .map(str::to_string)
+        };
+
+        let (contract_id, from_cache) = match cached_id {
+            Some(id) => (id, true),
+            None => {
+                let id = deploy_contract_with_retry(
+                    &mut transport,
+                    wasm_std_path,
+                    &source,
+                    &network,
+                    &package.name,
+                    &retry_config,
+                )?;
+                deploy_cache.put(package.name.as_str(), &wasm_sha, &network, &source, &id);
+                (id, false)
+            }
+        };
 
         if let Some(spinner) = spinner {
             spinner.finish_and_clear();
         }
 
-        eprintln!("Contract deployed at: {}", contract_id);
+        if from_cache {
+            eprintln!(
+                "Reusing cached deployment for '{}': {}",
+                package.name, contract_id
+            );
+        } else {
+            eprintln!("Contract deployed at: {}", contract_id);
+        }
 
         for function in exported_fns {
             if !args.quiet {
@@ -1757,6 +1852,17 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+    }
+
+    // Persist the deploy cache (#79). A write failure loses the warm
+    // entries for next run but must not fail a completed measurement run.
+    if let Err(e) = deploy_cache.save() {
+        if !args.quiet {
+            eprintln!(
+                "warning: could not write {}: {e:#}",
+                deploy_cache::CACHE_FILE
+            );
         }
     }
 
@@ -2062,7 +2168,7 @@ mod tests {
 
     #[test]
     fn build_invoke_args_without_function_args() {
-        let invoke_args = build_invoke_args("CCONTRACT", "alice", "testnet", "do_work", &[]);
+        let invoke_args = build_invoke_args("CCONTRACT", "alice", "testnet", "do_work", &[], None);
         assert_eq!(
             invoke_args,
             vec![
@@ -2082,9 +2188,43 @@ mod tests {
     }
 
     #[test]
+    fn build_invoke_args_uses_rpc_url_and_passphrase_for_a_custom_network() {
+        let invoke_args = build_invoke_args(
+            "CCONTRACT",
+            "alice",
+            "unused-alias",
+            "do_work",
+            &[],
+            Some((
+                "http://localhost:8000/soroban/rpc",
+                "Standalone Network ; February 2017",
+            )),
+        );
+        assert_eq!(
+            invoke_args,
+            vec![
+                "contract",
+                "invoke",
+                "--id",
+                "CCONTRACT",
+                "--source",
+                "alice",
+                "--rpc-url",
+                "http://localhost:8000/soroban/rpc",
+                "--network-passphrase",
+                "Standalone Network ; February 2017",
+                "--build-only",
+                "--",
+                "do_work",
+            ]
+        );
+    }
+
+    #[test]
     fn build_invoke_args_appends_function_args_after_separator() {
         let func_args = vec!["--n".to_string(), "10000".to_string()];
-        let invoke_args = build_invoke_args("CCONTRACT", "alice", "testnet", "do_work", &func_args);
+        let invoke_args =
+            build_invoke_args("CCONTRACT", "alice", "testnet", "do_work", &func_args, None);
         assert_eq!(
             invoke_args,
             vec![
@@ -2593,6 +2733,10 @@ mod tests {
             validate: false,
             record: None,
             replay: None,
+            rpc_url: None,
+            network_passphrase: None,
+            no_deploy_cache: false,
+            source_secret: None,
             profile: None,
             derive_limits: None,
             from: None,
@@ -2627,6 +2771,10 @@ mod tests {
             validate: false,
             record: None,
             replay: None,
+            rpc_url: None,
+            network_passphrase: None,
+            no_deploy_cache: false,
+            source_secret: None,
             profile: None,
             derive_limits: None,
             from: None,
@@ -2661,6 +2809,10 @@ mod tests {
             validate: false,
             record: None,
             replay: None,
+            rpc_url: None,
+            network_passphrase: None,
+            no_deploy_cache: false,
+            source_secret: None,
             profile: None,
             derive_limits: None,
             from: None,
@@ -2698,6 +2850,10 @@ mod tests {
             validate: false,
             record: None,
             replay: None,
+            rpc_url: None,
+            network_passphrase: None,
+            no_deploy_cache: false,
+            source_secret: None,
             profile: None,
             derive_limits: Some("tier-a-limits.env".to_string()),
             from: None,
